@@ -1,0 +1,138 @@
+#!/bin/bash
+SSH_CONFIG_PATH=~/.ssh/config
+
+is_default_identity_file() {
+    local path="$1"
+
+    case "$path" in
+        "$HOME/.ssh/id_rsa"|\
+        "$HOME/.ssh/id_ecdsa"|\
+        "$HOME/.ssh/id_ecdsa_sk"|\
+        "$HOME/.ssh/id_ed25519"|\
+        "$HOME/.ssh/id_ed25519_sk"|\
+        "$HOME/.ssh/id_dsa"|\
+        "$HOME/.ssh/id_xmss")
+            return 0
+            ;;
+        *)
+            return 1
+            ;;
+    esac
+}
+
+resolve_identity_file() {
+    local host="$1"
+    local raw_path=""
+    local abs_path=""
+    local custom_fallback=""
+
+    while IFS= read -r raw_path; do
+        [ "$raw_path" = "none" ] && continue
+
+        if [[ "$raw_path" == "~/"* ]]; then
+            abs_path="${HOME}/${raw_path:2}"
+        elif [[ "$raw_path" == /* ]]; then
+            abs_path="$raw_path"
+        else
+            abs_path="${HOME}/${raw_path#./}"
+        fi
+
+        if is_default_identity_file "$abs_path"; then
+            continue
+        fi
+
+        [ -z "$custom_fallback" ] && custom_fallback="$abs_path"
+        if [ -f "$abs_path" ]; then
+            printf "%s\n" "$abs_path"
+            return 0
+        fi
+    done < <(
+        ssh -G "$host" 2>/dev/null | awk '$1 == "identityfile" { print $2 }'
+    )
+
+    if [ -n "$custom_fallback" ]; then
+        printf "%s\n" "$custom_fallback"
+    fi
+}
+
+choose_ssh_config() {
+    if [ ! -f "$SSH_CONFIG_PATH" ]; then
+        echo "找不到 SSH 配置文件: $SSH_CONFIG_PATH"
+        return 1
+    fi
+
+    mapfile -t entries < <(
+        awk '
+        BEGIN { nhosts = 0; norder = 0 }
+        function add_host(h) {
+            if (h ~ /[*?]/) { return }
+            cur_hosts[++nhosts] = h
+            if (!(h in seen)) {
+                seen[h] = 1
+                host_order[++norder] = h
+            }
+            if (!(h in host_user)) { host_user[h] = "" }
+            if (!(h in host_name)) { host_name[h] = "" }
+            if (!(h in host_port)) { host_port[h] = "" }
+        }
+        {
+            key = tolower($1)
+            if (key == "host") {
+                nhosts = 0
+                delete cur_hosts
+                for (i = 2; i <= NF; i++) { add_host($i) }
+                next
+            }
+            if (key == "user") {
+                for (i = 1; i <= nhosts; i++) { host_user[cur_hosts[i]] = $2 }
+                next
+            }
+            if (key == "hostname") {
+                for (i = 1; i <= nhosts; i++) { host_name[cur_hosts[i]] = $2 }
+                next
+            }
+            if (key == "port") {
+                for (i = 1; i <= nhosts; i++) { host_port[cur_hosts[i]] = $2 }
+                next
+            }
+        }
+        END {
+            for (i = 1; i <= norder; i++) {
+                h = host_order[i]
+                print h "|" host_user[h] "|" host_name[h] "|" host_port[h]
+            }
+        }' "$SSH_CONFIG_PATH"
+    )
+
+    if [ "${#entries[@]}" -eq 0 ]; then
+        echo "未找到可用的 Host 配置。"
+        return 1
+    fi
+
+    echo "请选择要使用的 SSH 配置:"
+    echo
+    printf "%-4s %-20s %-16s %-24s %-5s %s\n" "ID" "HOST" "USER" "HOSTNAME" "PORT" "KEY"
+    printf "%-4s %-20s %-16s %-24s %-5s %s\n" "----" "----" "----" "--------" "----" "---"
+    for i in "${!entries[@]}"; do
+        IFS='|' read -r host user hostname port <<< "${entries[$i]}"
+        [ -z "$user" ] && user="$USER"
+        [ -z "$hostname" ] && hostname="$host"
+        [ -z "$port" ] && port="22"
+        key_path="$(resolve_identity_file "$host")"
+        printf "%-4s %-20.20s %-16.16s %-24.24s %-5.5s %s\n" $((i + 1)) "$host" "$user" "$hostname" "$port" "$key_path"
+    done
+    echo
+
+    while true; do
+        read -r -p "输入序号: " choice
+        if [[ "$choice" =~ ^[0-9]+$ ]] && [ "$choice" -ge 1 ] && [ "$choice" -le "${#entries[@]}" ]; then
+            IFS='|' read -r host user hostname port <<< "${entries[$((choice - 1))]}"
+            echo "正在连接: $host"
+            ssh "$host"
+            break
+        fi
+        echo "无效输入，请重试。"
+    done
+}
+
+choose_ssh_config
